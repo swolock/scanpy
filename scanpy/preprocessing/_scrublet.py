@@ -10,49 +10,53 @@ from . import _highly_variable_genes as hvg
 from ._utils import _get_mean_var
 from sklearn.utils.extmath import safe_sparse_dot
 from sklearn.utils import check_array, sparsefuncs
-from ..neighbors import neighbors
+from ..neighbors import compute_neighbors_umap, compute_connectivities_umap
+import time 
 
 from .. import logging as logg
 
 def scrublet(
-    adata: AnnData, 
+    adata: AnnData,
     sim_doublet_ratio: float = 2.0,
     n_neighbors: Optional[int] = None,
     expected_doublet_rate: float = 0.05, 
     find_highly_variable: bool = True,
     use_highly_variable: bool = True,
-    pca_kwarg_dict: dict = {},
-    gene_filter_kwarg_dict: dict = {},
+    pca_kwds: dict = {},
+    gene_filter_kwds: dict = {},
     synthetic_doublet_umi_subsampling: float = 1.0, 
     log_transform: bool = False,
     scale: bool = True, 
     zero_center: bool = True,
     max_value: Optional[float] = None,
-    copy: bool = False, 
-    verbose: bool = True,
     knn_method: str = 'umap',
-    knn_dist_metric: str = 'euclidean'
+    fuzzy_knn: bool = False,
+    knn_dist_metric: str = 'euclidean', 
+    random_state: int = 0, 
+    copy: bool = False
 ) -> Optional[AnnData]:
     """Predict doublets using Scrublet
     """
+
+    logg.info('Running Scrublet...')
+    t_start = time.time()
 
     adata_obs = adata.copy()
 
     if n_neighbors is None:
         n_neighbors = int(round(0.5*np.sqrt(adata.shape[0])))
 
-
-    _print_optional('Preprocessing...', verbose)
+    logg.msg('Preprocessing', v=4) 
     if 'n_counts' not in adata_obs.obs.keys():
         adata_obs.obs['n_counts'] = adata_obs.X.sum(1).A.squeeze()
     pp.normalize_per_cell(adata_obs, counts_per_cell_after=1e4)
 
     if use_highly_variable:
         if find_highly_variable:
+            gene_filter_kwds['inplace'] = False
             adata_obs.var['highly_variable'] = hvg.highly_variable_genes(
                 pp.log1p(adata_obs, copy=True), 
-                inplace=False,
-                **gene_filter_kwarg_dict
+                **gene_filter_kwds
             )['highly_variable']
         if 'highly_variable' in adata_obs.var.keys():
             adata_obs.raw = adata[:, adata_obs.var['highly_variable']]
@@ -65,9 +69,7 @@ def scrublet(
     else:
         adata_obs.raw = adata
 
-    _print_optional(f'Using {adata_obs.shape[1]} highly variable genes.')
-
-    _print_optional('Simulating doublets...', verbose)
+    logg.msg('Simulating doublets', v=4)
     adata_sim = _simulate_doublets(adata_obs, sim_doublet_ratio, synthetic_doublet_umi_subsampling)
     pp.normalize_per_cell(adata_sim, counts_per_cell_after=1e4, counts_per_cell=adata_sim.obs['n_counts'].values)
     
@@ -93,12 +95,13 @@ def scrublet(
         adata_obs.X[adata_obs.X > max_value] = max_value
         adata_sim.X[adata_sim.X > max_value] = max_value
 
-    _print_optional('Running dimensionality reduction...', verbose)
+    logg.msg('Running dimensionality reduction', v=4)
+    pca_kwds['zero_center'] = zero_center
+    pca_kwds['random_state'] = random_state
+    pca_kwds['return_info'] = True
     pca_obs, pca_components = pp.pca(
         adata_obs.X,
-        return_info=True, 
-        zero_center=zero_center,
-        **pca_kwarg_dict
+        **pca_kwds
     )[:2]
     if issparse(adata_sim.X):
         pca_sim = safe_sparse_dot(
@@ -109,14 +112,16 @@ def scrublet(
             (adata_sim.X - adata_obs.X.mean(0)[None, :]), 
             pca_components.T)        
 
-    _print_optional('Calculating doublet scores...', verbose)
+    logg.msg('Calculating doublet scores', v=4) 
     doublet_scores_obs, doublet_scores_sim = _nearest_neighbor_classifier(
         pca_obs, 
         pca_sim, 
         expected_doublet_rate, 
         n_neighbors=n_neighbors, 
         method=knn_method, 
-        knn_dist_metric=knn_dist_metric
+        knn_dist_metric=knn_dist_metric, 
+        fuzzy=fuzzy_knn, 
+        random_state=random_state
         )
 
     adata.obs['doublet_score'] = doublet_scores_obs
@@ -136,14 +141,10 @@ def scrublet(
         'variable_genes': adata_obs.var_names.values.astype(str)
     }
     
-    call_doublets(adata, verbose=verbose)
+    call_doublets(adata)
+    t_end = time.time()
+    logg.info('    Scrublet finished ({})'.format(logg._sec_to_str(t_end - t_start)))
     return 
-
-    # # put back into the adata object or return
-    # if inplace:
-    #     adata.X = bayesdata.values.transpose()
-    # else:
-    #     return bayesdata.values.transpose()
 
 def _simulate_doublets(
     adata: AnnData, 
@@ -213,7 +214,7 @@ def _scale_precomputed(X, column_means, column_vars, zero_center=True):
         else:
             X /= scale
 
-def _nearest_neighbor_classifier(pca_obs, pca_sim, expected_doublet_rate, n_neighbors=40, method='annoy', knn_dist_metric='euclidean'):
+def _nearest_neighbor_classifier(pca_obs, pca_sim, expected_doublet_rate, n_neighbors=20, method='umap', knn_dist_metric='euclidean', fuzzy=False, random_state=0):
     pca_merged = np.vstack((pca_obs, pca_sim))
     adata_merged = AnnData(np.zeros((pca_merged.shape[0], 1)))
     adata_merged.obsm['X_pca'] = pca_merged
@@ -228,19 +229,34 @@ def _nearest_neighbor_classifier(pca_obs, pca_sim, expected_doublet_rate, n_neig
     
     # Find k_adj nearest neighbors
     if method == 'annoy':
-        neigh = _get_knn_graph(adata_merged.obsm['X_pca'], k=k_adj, dist_metric=knn_dist_metric, approx=True, return_edges=False)
-        n_sim_neigh = (neigh >= n_obs).sum(1)
-        n_obs_neigh = (neigh < n_obs).sum(1)
+        knn_indices, knn_distances = _get_knn_graph_annoy(
+            adata_merged.obsm['X_pca'], 
+            n_neighbors=k_adj, 
+            dist_metric=knn_dist_metric)
     elif method == 'umap':
-        neighbors(
-           adata_merged,
-           n_neighbors=k_adj,
-           n_pcs=adata_merged.obsm['X_pca'].shape[1],
-           use_rep='X_pca', 
-           metric=knn_dist_metric)
-        adjacency = adata_merged.uns['neighbors']['connectivities'] > 0
+        knn_indices, knn_distances = compute_neighbors_umap(
+                adata_merged.obsm['X_pca'], 
+                k_adj+1, 
+                random_state, 
+                metric=knn_dist_metric)[:2]
+        knn_indices = knn_indices[:, 1:]
+        knn_distances = knn_distances[:, 1:]
+    else:
+        raise ValueError('Nearest neighbor method must be \'umap\' or \'annoy\'.')
+
+    if fuzzy:
+        distances, connectivities = compute_connectivities_umap(
+                knn_indices, knn_distances, adata_merged.shape[0], k_adj)
+        adjacency = connectivities > 0
         n_sim_neigh = adjacency[:, n_obs:].sum(1).A.squeeze()
         n_obs_neigh = adjacency[:, :n_obs].sum(1).A.squeeze()
+
+        #adjacency = adata_merged.uns['neighbors']['distances'] > 0
+        #n_sim_neigh = adjacency[:, n_obs:].sum(1).A.squeeze()
+        #n_obs_neigh = adjacency[:, :n_obs].sum(1).A.squeeze()
+    else:
+        n_sim_neigh = (knn_indices >= n_obs).sum(1)
+        n_obs_neigh = (knn_indices < n_obs).sum(1)
 
     # Calculate doublet score based on ratio of simulated cell neighbors vs. observed cell neighbors
     rho = expected_doublet_rate
@@ -248,7 +264,6 @@ def _nearest_neighbor_classifier(pca_obs, pca_sim, expected_doublet_rate, n_neig
     nd = n_sim_neigh.astype(float)
     ns = n_obs_neigh.astype(float)
     N = (nd + ns).astype(float)
-    print(k_adj, N.min(), N.max())
     
     # Bayesian
     q=(nd+1)/(N+2)
@@ -262,54 +277,39 @@ def _nearest_neighbor_classifier(pca_obs, pca_sim, expected_doublet_rate, n_neig
 
 
 
-def _get_knn_graph(X, k=5, dist_metric='euclidean', approx=False, return_edges=True):
-    '''
+def _get_knn_graph_annoy(X, n_neighbors=5, dist_metric='euclidean'):
+    ''' 
     Build k-nearest-neighbor graph
     Return edge list and nearest neighbor matrix
-    '''
-    if approx:
-        try:
-            from annoy import AnnoyIndex
-        except:
-            approx = False
-            print('Could not find library "annoy" for approx. nearest neighbor search')
-    if approx:
-        if dist_metric == 'cosine':
-            dist_metric = 'angular'
-        npc = X.shape[1]
-        ncell = X.shape[0]
-        annoy_index = AnnoyIndex(npc, metric=dist_metric)
+    '''       
+    try:
+        from annoy import AnnoyIndex
+    except ImportError:
+        raise ImportError(
+            'Please install the package "annoy". '
+            'Alternatively, set `knn_method=\'umap\'.')  
+    if dist_metric == 'cosine':
+        dist_metric = 'angular'
+    npc = X.shape[1]
+    ncell = X.shape[0]
+    annoy_index = AnnoyIndex(npc, metric=dist_metric)
 
-        for i in range(ncell):
-            annoy_index.add_item(i, list(X[i,:]))
-        annoy_index.build(10) # 10 trees
+    for i in range(ncell):
+        annoy_index.add_item(i, list(X[i,:]))
+    annoy_index.build(10) # 10 trees
 
-        knn = []
-        for iCell in range(ncell):
-            knn.append(annoy_index.get_nns_by_item(iCell, k + 1)[1:])
-        knn = np.array(knn, dtype=int)
+    knn = []
+    knn_dists = []
+    for iCell in range(ncell):
+        neighbors, dists = annoy_index.get_nns_by_item(iCell, n_neighbors+1, include_distances=True)
+        knn.append(neighbors[1:])
+        knn_dists.append(dists[1:])
+    knn = np.array(knn, dtype=int)
+    knn_dists = np.array(knn_dists)
 
-    else:
-        if dist_metric == 'cosine':
-            nbrs = NearestNeighbors(n_neighbors=k, metric=dist_metric, algorithm='brute').fit(X)
-        else:
-            nbrs = NearestNeighbors(n_neighbors=k, metric=dist_metric).fit(X)
-        knn = nbrs.kneighbors(return_distance=False)
+    return knn, knn_dists
 
-    if return_edges:
-        links = set([])
-        for i in range(knn.shape[0]):
-            for j in knn[i,:]:
-                links.add(tuple(sorted((i,j))))
-        return links, knn
-    return knn
-
-def _print_optional(string, verbose=True):
-    if verbose:
-        print(string)
-    return
-
-def call_doublets(adata, threshold=None, verbose=True):
+def call_doublets(adata, threshold=None):
     ''' Call trancriptomes as doublets or singlets
 
     Arguments
@@ -322,9 +322,6 @@ def call_doublets(adata, threshold=None, verbose=True):
         using the `doublet_scores_sim_` histogram and/or based on 
         co-localization of predicted doublets in a 2-D embedding.
 
-    verbose : bool, optional (default: True)
-        If True, print summary statistics.
-
     Sets
     ----
     predicted_doublets_, z_scores_, threshold_,
@@ -332,29 +329,37 @@ def call_doublets(adata, threshold=None, verbose=True):
     overall_doublet_rate_
     '''
 
+    if 'scrublet' not in adata.uns:
+        raise ValueError(
+            '\'scrublet\' not found in `adata.uns`. You must run '
+            'sc.external.pp.scrublet.scrublet() first.')
     Ld_obs = adata.obs['doublet_score'].values
     Ld_sim = adata.uns['scrublet']['doublet_scores_sim']
 
     if threshold is None:
         # automatic threshold detection
         # http://scikit-image.org/docs/dev/api/skimage.filters.html
-
-
         try:
             from skimage.filters import threshold_minimum
         except ImportError:
-            raise ImportError(
-                'Please install the package scikit-image to enable automatic threshold calling.'
-                'To set threshold manually, use `sc.pp.scrublet.call_doublets()`.')        
+            logg.warn('Unable to set doublet score threshold automatically, '
+                      'so it has been set to 1 by default. To enable '
+                      'automatic threshold detection, install the package '
+                      '\'scikit-image\'. Alternatively, manually '
+                      'specify a threshold and call doublets '
+                      'using `sc.external.pp.scrublet.call_doublets(adata, threshold)`.')  
+            adata.obs['predicted_doublet'] = pd.Categorical(np.repeat(False, adata.obs.shape[0]))
+            adata.uns['scrublet']['threshold'] = 1
+            return    
         try:
             threshold = threshold_minimum(Ld_sim)
-            if verbose:
-                print("Automatically set threshold at doublet score = {:.2f}".format(threshold))
+            logg.msg('   Automatically set threshold at '
+                     'doublet score = {:.2f}'.format(threshold), v=4) 
         except:
             adata.obs['predicted_doublet'] = pd.Categorical(np.repeat(False, adata.obs.shape[0]))
             adata.uns['scrublet']['threshold'] = 1
-            if verbose:
-                print("Warning: failed to automatically identify doublet score threshold. Run `sc.pp.scrublet.call_doublets()` with user-specified threshold.")
+            logg.warn('Failed to automatically identify doublet score threshold. '
+                      'Run `sc.pp.scrublet.call_doublets()` with user-specified threshold.')
             return 
 
     adata.uns['scrublet']['threshold'] = threshold
@@ -366,12 +371,11 @@ def call_doublets(adata, threshold=None, verbose=True):
     adata.uns['scrublet']['detectable_doublet_fraction'] = detectable_frac
     adata.uns['scrublet']['overall_doublet_rate'] = detected_rate / detectable_frac
 
-    if verbose:
-        print('Detected doublet rate = {:.1f}%'.format(100*detected_rate))
-        print('Estimated detectable doublet fraction = {:.1f}%'.format(100 * detectable_frac))
-        print('Overall doublet rate:')
-        print('\tExpected   = {:.1f}%'.format(100 * adata.uns['scrublet']['parameters']['expected_doublet_rate']))
-        print('\tEstimated  = {:.1f}%'.format(100 * adata.uns['scrublet']['overall_doublet_rate']))
+    logg.msg('    Detected doublet rate = {:.1f}%'.format(100*detected_rate), v=4)
+    logg.msg('    Estimated detectable doublet fraction = {:.1f}%'.format(100 * detectable_frac), v=4)
+    logg.msg('    Overall doublet rate:', v=4)
+    logg.msg('        Expected   = {:.1f}%'.format(100 * adata.uns['scrublet']['parameters']['expected_doublet_rate']), v=4)
+    logg.msg('        Estimated  = {:.1f}%'.format(100 * adata.uns['scrublet']['overall_doublet_rate']), v=4)
         
     return
 
